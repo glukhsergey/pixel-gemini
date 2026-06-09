@@ -6,8 +6,11 @@ Logs into a Gmail account, navigates to Google One, detects the
 """
 
 import logging
-import time
+import os
 import re
+import shutil
+import subprocess
+import time
 from urllib.parse import urlparse
 from typing import Optional
 
@@ -29,7 +32,63 @@ from device_simulator import DeviceProfile
 logger = logging.getLogger(__name__)
 
 
+class GoogleAutomationError(Exception):
+    """Raised when automation encounters an unrecoverable error."""
+
+
 # ── Driver factory ────────────────────────────────────────────────────────────
+
+def _first_existing_path(*paths: str) -> Optional[str]:
+    """Return the first non-empty path that points to an executable file."""
+    for path in paths:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _resolve_chrome_binary() -> Optional[str]:
+    """Locate a Chrome/Chromium binary without invoking Selenium Manager."""
+    return _first_existing_path(
+        os.environ.get("CHROME_BINARY", ""),
+        os.environ.get("GOOGLE_CHROME_BIN", ""),
+        shutil.which("google-chrome") or "",
+        shutil.which("google-chrome-stable") or "",
+        shutil.which("chromium") or "",
+        shutil.which("chromium-browser") or "",
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    )
+
+
+def _resolve_chromedriver_path() -> Optional[str]:
+    """Locate a system chromedriver before Selenium tries its downloaded cache."""
+    return _first_existing_path(
+        os.environ.get("CHROMEDRIVER_PATH", ""),
+        os.environ.get("CHROMEWEBDRIVER", ""),
+        shutil.which("chromedriver") or "",
+        "/usr/bin/chromedriver",
+        "/usr/local/bin/chromedriver",
+    )
+
+
+def _binary_version(binary_path: str) -> str:
+    """Best-effort '<binary> --version' output for diagnostics."""
+    try:
+        completed = subprocess.run(
+            [binary_path, "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as exc:
+        return f"unavailable ({exc})"
+
+    output = (completed.stdout or completed.stderr).strip()
+    return output or f"exited with status {completed.returncode}"
+
 
 def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     """Return a headless Chrome WebDriver configured for the device profile."""
@@ -39,13 +98,29 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
         options.add_argument("--headless=new")
 
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-notifications")
     options.add_argument("--window-size=390,844")  # Pixel 10 Pro screen size
     options.add_argument(f"--user-agent={profile.user_agent}")
+
+    chrome_binary = _resolve_chrome_binary()
+    if chrome_binary:
+        options.binary_location = chrome_binary
+        logger.info(
+            "Using Chrome binary: %s (%s)",
+            chrome_binary,
+            _binary_version(chrome_binary),
+        )
+    else:
+        logger.warning(
+            "Chrome/Chromium binary was not found on PATH; "
+            "Selenium Manager will try to locate it."
+        )
 
     # Mobile emulation – Pixel 10 Pro viewport
     mobile_emulation = {
@@ -59,8 +134,33 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     options.add_experimental_option("useAutomationExtension", False)
     options.add_argument("--disable-blink-features=AutomationControlled")
 
-    service = Service()  # relies on chromedriver being on PATH (Replit provides it)
-    driver = webdriver.Chrome(service=service, options=options)
+    chromedriver_path = _resolve_chromedriver_path()
+    if chromedriver_path:
+        logger.info(
+            "Using ChromeDriver binary: %s (%s)",
+            chromedriver_path,
+            _binary_version(chromedriver_path),
+        )
+        service = Service(executable_path=chromedriver_path)
+    else:
+        logger.warning(
+            "ChromeDriver was not found on PATH; "
+            "Selenium Manager will try its cache/download flow."
+        )
+        service = Service()
+
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+    except WebDriverException as exc:
+        raise GoogleAutomationError(
+            "Could not start ChromeDriver. On Replit, install the system "
+            "Chromium and ChromeDriver packages (this repo includes replit.nix), "
+            "or set CHROME_BINARY and CHROMEDRIVER_PATH to working binaries. "
+            "If the cached Selenium driver exits with status 127, remove "
+            "~/.cache/selenium so Selenium stops reusing the broken binary. "
+            f"Original error: {exc}"
+        ) from exc
+
     driver.implicitly_wait(config.IMPLICIT_WAIT)
     driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
     return driver
@@ -250,10 +350,6 @@ def _navigate_google_one(driver: webdriver.Chrome) -> Optional[str]:
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
-
-class GoogleAutomationError(Exception):
-    """Raised when automation encounters an unrecoverable error."""
-
 
 def check_gemini_offer(email: str, password: str,
                        device: DeviceProfile) -> Optional[str]:

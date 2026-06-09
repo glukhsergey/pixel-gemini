@@ -92,12 +92,12 @@ class DeviceProfile:
     def summary(self) -> str:
         """Human-readable summary for Telegram messages."""
         return (
-            f"📱 *Device Profile*\n"
+            f"📱 Device Profile\n"
             f"Model: {self.model}\n"
             f"Android: {self.android_version}\n"
-            f"IMEI: `{self.imei}`\n"
-            f"Android ID: `{self.android_id}`\n"
-            f"Session: `{self.session_id[:8]}…`"
+            f"IMEI: {self.imei}\n"
+            f"Android ID: {self.android_id}\n"
+            f"Session: {self.session_id[:8]}…"
         )
 
 

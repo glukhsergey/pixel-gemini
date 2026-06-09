@@ -75,6 +75,37 @@ The bot will start polling for Telegram updates.
 
 ---
 
+### Troubleshooting
+
+#### `409 Conflict: terminated by other getUpdates request`
+
+Telegram allows only one active long-polling process per bot token. If you see
+this error, stop every other copy of the bot that uses the same
+`TELEGRAM_BOT_TOKEN` before starting `python main.py` again. Common places to
+check on Replit are:
+
+- another open Shell/Console tab running `python main.py`;
+- the Replit Run button process;
+- an active Deployment using the same bot token.
+
+The bot also creates a local lock file at `/tmp/pixel-gemini-bot.lock` to catch
+duplicate processes in the same Replit container before they start polling. You
+can override the lock path with `PIXEL_GEMINI_BOT_LOCK_FILE` if needed.
+
+#### `ImportError: cannot import name 'Update' from 'telegram'`
+
+This means the unrelated PyPI package named `telegram` is installed and is
+shadowing `python-telegram-bot`. The bot now tries to repair this automatically
+when `python main.py` starts. If automatic repair is disabled or fails, run:
+
+```bash
+python -m pip uninstall -y telegram
+python -m pip install --upgrade --force-reinstall python-telegram-bot==21.3
+```
+
+Do not install the package named `telegram`; this project depends on
+`python-telegram-bot`.
+
 ## Usage
 
 | Command | Description |

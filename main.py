@@ -9,11 +9,76 @@ Commands:
   /status       – Show current session status and device profile
 """
 
+import fcntl
+import importlib
+import importlib.util
 import logging
 import os
+import subprocess
 import sys
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+TELEGRAM_REQUIREMENT = "python-telegram-bot==21.3"
+
+
+def _telegram_package_is_valid() -> bool:
+    """Return True when the installed telegram package is python-telegram-bot."""
+    if importlib.util.find_spec("telegram") is None:
+        return False
+
+    telegram_module = importlib.import_module("telegram")
+    return hasattr(telegram_module, "Update")
+
+
+def _repair_telegram_dependency() -> None:
+    """Install python-telegram-bot when conflicting telegram is present."""
+    if os.environ.get("PIXEL_GEMINI_SKIP_DEP_REPAIR") == "1":
+        sys.stderr.write(
+            "Invalid telegram package installed. Run:\n"
+            "  python -m pip uninstall -y telegram\n"
+            "  python -m pip install --upgrade --force-reinstall "
+            f"{TELEGRAM_REQUIREMENT}\n"
+        )
+        sys.exit(1)
+
+    if os.environ.get("PIXEL_GEMINI_DEP_REPAIR_ATTEMPTED") == "1":
+        sys.stderr.write(
+            "Tried to repair telegram dependency, but the import is still invalid. "
+            "Run `python -m pip uninstall -y telegram` and "
+            "`python -m pip install --upgrade --force-reinstall "
+            f"{TELEGRAM_REQUIREMENT}`.\n"
+        )
+        sys.exit(1)
+
+    sys.stderr.write(
+        "Invalid telegram package detected; installing python-telegram-bot...\n"
+    )
+    subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "telegram"],
+        check=False,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            TELEGRAM_REQUIREMENT,
+        ],
+        check=True,
+    )
+
+    env = os.environ.copy()
+    env["PIXEL_GEMINI_DEP_REPAIR_ATTEMPTED"] = "1"
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+
+if not _telegram_package_is_valid():
+    _repair_telegram_dependency()
+
+from telegram import Update, ReplyKeyboardRemove
+from telegram.error import BadRequest, Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,6 +96,9 @@ from google_automation import GoogleAutomationError, check_gemini_offer
 logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
+# Keep the lock file open for the whole process lifetime.
+_LOCK_FILE_HANDLE = None
+
 # ── Conversation states ───────────────────────────────────────────────────────
 AWAIT_EMAIL, AWAIT_PASSWORD = range(2)
 
@@ -42,6 +110,54 @@ def _get_session(chat_id: int) -> dict:
     if chat_id not in config.SESSION_STORE:
         config.SESSION_STORE[chat_id] = {}
     return config.SESSION_STORE[chat_id]
+
+
+def _acquire_single_instance_lock() -> None:
+    """Prevent duplicate local polling processes from using one bot token."""
+    global _LOCK_FILE_HANDLE
+
+    lock_path = os.environ.get(
+        "PIXEL_GEMINI_BOT_LOCK_FILE",
+        "/tmp/pixel-gemini-bot.lock",
+    )
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        logger.error(
+            "Another local bot process is already running. "
+            "Stop it before starting this one. Lock file: %s",
+            lock_path,
+        )
+        sys.exit(1)
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(f"{os.getpid()}\n")
+    lock_file.flush()
+    _LOCK_FILE_HANDLE = lock_file
+
+
+async def error_handler(update: object,
+                        context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log known Telegram API errors without noisy tracebacks."""
+    error = context.error
+
+    if isinstance(error, Conflict):
+        logger.error(
+            "Telegram polling conflict: another bot instance is already "
+            "calling getUpdates for this token. Stop the other Replit run, "
+            "deployment, or terminal process. This instance will stop now."
+        )
+        context.application.stop_running()
+        return
+
+    if isinstance(error, BadRequest):
+        logger.warning("Telegram rejected a message: %s", error)
+        return
+
+    logger.error("Unhandled bot error while processing update %r",
+                 update, exc_info=error)
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
@@ -82,8 +198,7 @@ async def login_email(update: Update,
     email = update.message.text.strip()
     context.user_data["pending_email"] = email
     await update.message.reply_text(
-        f"✅ Email received: `{email}`\n\n🔒 Now enter your password:",
-        parse_mode="Markdown",
+        f"✅ Email received: {email}\n\n🔒 Now enter your password:"
     )
     return AWAIT_PASSWORD
 
@@ -110,12 +225,11 @@ async def login_password(update: Update,
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
-            "✅ *Credentials saved* and a new Pixel 10 Pro device profile has "
+            "✅ Credentials saved and a new Pixel 10 Pro device profile has "
             "been created for this session.\n\n"
             + session["device"].summary()
-            + "\n\nUse /check\\_offer to search for the Gemini Pro offer."
+            + "\n\nUse /check_offer to search for the Gemini Pro offer."
         ),
-        parse_mode="Markdown",
     )
     return ConversationHandler.END
 
@@ -162,7 +276,7 @@ async def check_offer(update: Update,
             device,
         )
     except GoogleAutomationError as exc:
-        await update.message.reply_text(f"❌ *Error:* {exc}", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Error: {exc}")
         return
     except Exception as exc:
         logger.exception("Unexpected error in check_offer for chat %s", chat_id)
@@ -174,11 +288,10 @@ async def check_offer(update: Update,
     if offer_link:
         session["offer_link"] = offer_link
         await update.message.reply_text(
-            "🎉 *Gemini Pro Offer Found!*\n\n"
+            "🎉 Gemini Pro Offer Found!\n\n"
             "Click the link below to activate your 12-month free Gemini Pro:\n\n"
             f"🔗 {offer_link}\n\n"
-            "_Use /get\\_link to retrieve this link again._",
-            parse_mode="Markdown",
+            "Use /get_link to retrieve this link again."
         )
     else:
         await update.message.reply_text(
@@ -200,14 +313,12 @@ async def get_link(update: Update,
 
     if link:
         await update.message.reply_text(
-            f"🔗 *Last captured offer link:*\n\n{link}",
-            parse_mode="Markdown",
+            f"🔗 Last captured offer link:\n\n{link}"
         )
     else:
         await update.message.reply_text(
             "ℹ️ No offer link has been captured yet. "
-            "Use /check\\_offer to search for the Gemini Pro offer.",
-            parse_mode="Markdown",
+            "Use /check_offer to search for the Gemini Pro offer."
         )
 
 
@@ -231,8 +342,8 @@ async def status(update: Update,
     device = session.get("device")
 
     lines = [
-        "📊 *Session Status*\n",
-        f"Account: `{email}`",
+        "📊 Session Status\n",
+        f"Account: {email}",
         f"Credentials loaded: {'✅' if has_creds else '❌'}",
         f"Offer link captured: {'✅' if offer_link else '❌'}",
     ]
@@ -240,10 +351,7 @@ async def status(update: Update,
     if device:
         lines.append("\n" + device.summary())
 
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("\n".join(lines))
 
 
 # ── Application setup ─────────────────────────────────────────────────────────
@@ -257,7 +365,10 @@ def main() -> None:
         )
         sys.exit(1)
 
+    _acquire_single_instance_lock()
+
     app = Application.builder().token(token).build()
+    app.add_error_handler(error_handler)
 
     # /login conversation
     login_conv = ConversationHandler(
