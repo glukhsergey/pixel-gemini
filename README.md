@@ -75,6 +75,23 @@ The bot will start polling for Telegram updates.
 
 ---
 
+### Troubleshooting
+
+#### `409 Conflict: terminated by other getUpdates request`
+
+Telegram allows only one active long-polling process per bot token. If you see
+this error, stop every other copy of the bot that uses the same
+`TELEGRAM_BOT_TOKEN` before starting `python main.py` again. Common places to
+check on Replit are:
+
+- another open Shell/Console tab running `python main.py`;
+- the Replit Run button process;
+- an active Deployment using the same bot token.
+
+The bot also creates a local lock file at `/tmp/pixel-gemini-bot.lock` to catch
+duplicate processes in the same Replit container before they start polling. You
+can override the lock path with `PIXEL_GEMINI_BOT_LOCK_FILE` if needed.
+
 ## Usage
 
 | Command | Description |
