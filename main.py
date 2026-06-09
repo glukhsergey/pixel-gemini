@@ -10,11 +10,74 @@ Commands:
 """
 
 import fcntl
+import importlib
+import importlib.util
 import logging
 import os
+import subprocess
 import sys
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+TELEGRAM_REQUIREMENT = "python-telegram-bot==21.3"
+
+
+def _telegram_package_is_valid() -> bool:
+    """Return True when the installed telegram package is python-telegram-bot."""
+    if importlib.util.find_spec("telegram") is None:
+        return False
+
+    telegram_module = importlib.import_module("telegram")
+    return hasattr(telegram_module, "Update")
+
+
+def _repair_telegram_dependency() -> None:
+    """Install python-telegram-bot when conflicting telegram is present."""
+    if os.environ.get("PIXEL_GEMINI_SKIP_DEP_REPAIR") == "1":
+        sys.stderr.write(
+            "Invalid telegram package installed. Run:\n"
+            "  python -m pip uninstall -y telegram\n"
+            "  python -m pip install --upgrade --force-reinstall "
+            f"{TELEGRAM_REQUIREMENT}\n"
+        )
+        sys.exit(1)
+
+    if os.environ.get("PIXEL_GEMINI_DEP_REPAIR_ATTEMPTED") == "1":
+        sys.stderr.write(
+            "Tried to repair telegram dependency, but the import is still invalid. "
+            "Run `python -m pip uninstall -y telegram` and "
+            "`python -m pip install --upgrade --force-reinstall "
+            f"{TELEGRAM_REQUIREMENT}`.\n"
+        )
+        sys.exit(1)
+
+    sys.stderr.write(
+        "Invalid telegram package detected; installing python-telegram-bot...\n"
+    )
+    subprocess.run(
+        [sys.executable, "-m", "pip", "uninstall", "-y", "telegram"],
+        check=False,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            TELEGRAM_REQUIREMENT,
+        ],
+        check=True,
+    )
+
+    env = os.environ.copy()
+    env["PIXEL_GEMINI_DEP_REPAIR_ATTEMPTED"] = "1"
+    os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+
+if not _telegram_package_is_valid():
+    _repair_telegram_dependency()
+
+from telegram import Update, ReplyKeyboardRemove
 from telegram.error import BadRequest, Conflict
 from telegram.ext import (
     Application,

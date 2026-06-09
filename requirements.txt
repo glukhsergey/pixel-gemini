@@ -1,4 +1,5 @@
 # Core bot framework
+# Do not install the unrelated package named telegram; it breaks imports.
 python-telegram-bot==21.3
 
 # Browser automation
